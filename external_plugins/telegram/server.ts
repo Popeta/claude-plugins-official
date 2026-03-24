@@ -19,7 +19,8 @@ import { z } from 'zod'
 import { Bot, GrammyError, InlineKeyboard, InputFile, type Context } from 'grammy'
 import type { ReactionTypeEmoji } from 'grammy/types'
 import { randomBytes } from 'crypto'
-import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync } from 'fs'
+import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync, existsSync } from 'fs'
+import { execFileSync } from 'child_process'
 import { homedir } from 'os'
 import { join, extname, sep } from 'path'
 
@@ -111,6 +112,22 @@ function defaultAccess(): Access {
 
 const MAX_CHUNK_LIMIT = 4096
 const MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024
+
+// Typing loop — keeps "typing..." visible until Claude replies.
+const typingIntervals = new Map<string, NodeJS.Timeout>()
+
+function startTyping(chat_id: string): void {
+  stopTyping(chat_id)
+  void bot.api.sendChatAction(chat_id, 'typing').catch(() => {})
+  typingIntervals.set(chat_id, setInterval(() => {
+    void bot.api.sendChatAction(chat_id, 'typing').catch(() => {})
+  }, 4000))
+}
+
+function stopTyping(chat_id: string): void {
+  const iv = typingIntervals.get(chat_id)
+  if (iv) { clearInterval(iv); typingIntervals.delete(chat_id) }
+}
 
 // reply's files param takes any path. .env is ~60 bytes and ships as a
 // document. Claude can already Read+paste file contents, so this isn't a new
@@ -552,6 +569,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           }
         }
 
+        stopTyping(chat_id)
         const result =
           sentIds.length === 1
             ? `sent (id: ${sentIds[0]})`
@@ -560,6 +578,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       }
       case 'react': {
         assertAllowedChat(args.chat_id as string)
+        stopTyping(args.chat_id as string)
         await bot.api.setMessageReaction(args.chat_id as string, Number(args.message_id), [
           { type: 'emoji', emoji: args.emoji as ReactionTypeEmoji['emoji'] },
         ])
@@ -585,6 +604,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       }
       case 'edit_message': {
         assertAllowedChat(args.chat_id as string)
+        stopTyping(args.chat_id as string)
         const editFormat = (args.format as string | undefined) ?? 'text'
         const editParseMode = editFormat === 'markdownv2' ? 'MarkdownV2' as const : undefined
         const edited = await bot.api.editMessageText(
@@ -791,12 +811,46 @@ bot.on('message:document', async ctx => {
 
 bot.on('message:voice', async ctx => {
   const voice = ctx.message.voice
-  const text = ctx.message.caption ?? '(voice message)'
+  const caption = ctx.message.caption
+
+  // Auto-transcribe: download + mlx_whisper, fallback to file_id pass-through.
+  let transcript: string | undefined
+  try {
+    const file = await bot.api.getFile(voice.file_id)
+    if (file.file_path) {
+      const url = `https://api.telegram.org/file/bot${TOKEN}/${file.file_path}`
+      const res = await fetch(url)
+      const buf = Buffer.from(await res.arrayBuffer())
+      const voicePath = join(INBOX_DIR, `${Date.now()}-voice.oga`)
+      mkdirSync(INBOX_DIR, { recursive: true })
+      writeFileSync(voicePath, buf)
+
+      const outDir = join(INBOX_DIR, `whisper_${Date.now()}`)
+      mkdirSync(outDir, { recursive: true })
+      execFileSync('mlx_whisper', [
+        voicePath, '--language', 'ru', '-f', 'txt', '-o', outDir,
+        '--model', 'mlx-community/whisper-small-mlx',
+      ], { timeout: 30000, stdio: 'pipe' })
+      const txtFiles = readdirSync(outDir).filter(f => f.endsWith('.txt'))
+      if (txtFiles.length > 0) {
+        transcript = readFileSync(join(outDir, txtFiles[0]), 'utf8').trim()
+      }
+      // Cleanup whisper temp
+      for (const f of readdirSync(outDir)) rmSync(join(outDir, f))
+      rmSync(outDir, { recursive: true, force: true })
+      rmSync(voicePath, { force: true })
+    }
+  } catch (err) {
+    process.stderr.write(`telegram channel: voice auto-transcribe failed: ${err}\n`)
+  }
+
+  const text = caption ?? transcript ?? '(voice message)'
   await handleInbound(ctx, text, undefined, {
     kind: 'voice',
     file_id: voice.file_id,
     size: voice.file_size,
     mime: voice.mime_type,
+    ...(transcript ? {} : {}),
   })
 })
 
@@ -904,8 +958,8 @@ async function handleInbound(
     return
   }
 
-  // Typing indicator — signals "processing" until we reply (or ~5s elapses).
-  void bot.api.sendChatAction(chat_id, 'typing').catch(() => {})
+  // Typing loop — keeps "typing..." visible until Claude replies or reacts.
+  startTyping(chat_id)
 
   // Ack reaction — lets the user know we're processing. Fire-and-forget.
   // Telegram only accepts a fixed emoji whitelist — if the user configures
@@ -932,6 +986,7 @@ async function handleInbound(
         user: from.username ?? String(from.id),
         user_id: String(from.id),
         ts: new Date((ctx.message?.date ?? 0) * 1000).toISOString(),
+        ...(ctx.message?.forward_origin ? { forwarded: 'true' } : {}),
         ...(imagePath ? { image_path: imagePath } : {}),
         ...(attachment ? {
           attachment_kind: attachment.kind,
