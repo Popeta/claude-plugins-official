@@ -54,19 +54,34 @@ if (!TOKEN) {
 const INBOX_DIR = join(STATE_DIR, 'inbox')
 const PID_FILE = join(STATE_DIR, 'bot.pid')
 
-// Telegram allows exactly one getUpdates consumer per token. If a previous
-// session crashed (SIGKILL, terminal closed) its server.ts grandchild can
-// survive as an orphan and hold the slot forever, so every new session sees
-// 409 Conflict. Kill any stale holder before we start polling.
+// Telegram allows exactly one getUpdates consumer per token. Policy: the
+// FIRST live session owns the bot. New sessions that find a live owner
+// exit cleanly — telegram tools become unavailable in the new session,
+// which is the desired behavior when the user is orchestrating multiple
+// Claude Code instances (e.g. Paperclip) and wants incoming Telegram
+// messages routed to the original interactive session only.
+//
+// Dead/stale PID files (previous owner crashed) are reclaimed: process.kill
+// with signal 0 throws ESRCH if the PID doesn't exist, which is caught and
+// lets this process take over.
 mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
+let ownerAlive = false
+let owningPid = 0
 try {
-  const stale = parseInt(readFileSync(PID_FILE, 'utf8'), 10)
-  if (stale > 1 && stale !== process.pid) {
-    process.kill(stale, 0)
-    process.stderr.write(`telegram channel: replacing stale poller pid=${stale}\n`)
-    process.kill(stale, 'SIGTERM')
+  owningPid = parseInt(readFileSync(PID_FILE, 'utf8'), 10)
+  if (owningPid > 1 && owningPid !== process.pid) {
+    process.kill(owningPid, 0) // throws if dead -> caught -> ownerAlive stays false
+    ownerAlive = true
   }
 } catch {}
+
+if (ownerAlive) {
+  process.stderr.write(
+    `telegram channel: another session already owns the bot (pid=${owningPid}). ` +
+    `This session will not start polling. Use the original session to send/receive Telegram messages.\n`
+  )
+  process.exit(0)
+}
 writeFileSync(PID_FILE, String(process.pid))
 
 // Last-resort safety net — without these the process dies silently on any
