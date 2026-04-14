@@ -115,6 +115,7 @@ const MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024
 
 // Typing loop — keeps "typing..." visible until Claude replies.
 const typingIntervals = new Map<string, NodeJS.Timeout>()
+const typingTimeouts = new Map<string, NodeJS.Timeout>()
 
 function startTyping(chat_id: string): void {
   stopTyping(chat_id)
@@ -122,11 +123,77 @@ function startTyping(chat_id: string): void {
   typingIntervals.set(chat_id, setInterval(() => {
     void bot.api.sendChatAction(chat_id, 'typing').catch(() => {})
   }, 4000))
+  // Safety: auto-stop typing after 60s to prevent stuck indicators
+  typingTimeouts.set(chat_id, setTimeout(() => stopTyping(chat_id), 60000))
 }
 
 function stopTyping(chat_id: string): void {
   const iv = typingIntervals.get(chat_id)
   if (iv) { clearInterval(iv); typingIntervals.delete(chat_id) }
+  const to = typingTimeouts.get(chat_id)
+  if (to) { clearTimeout(to); typingTimeouts.delete(chat_id) }
+}
+
+// ── Message debounce ──────────────────────────────────────────────────
+// When multiple messages arrive quickly (e.g. forwarded pair, photo+caption),
+// batch them into a single MCP notification so Claude sees full context.
+const DEBOUNCE_MS = 3000
+type PendingMsg = { content: string; meta: Record<string, string> }
+const pendingMessages = new Map<string, PendingMsg[]>()
+const flushTimers = new Map<string, ReturnType<typeof setTimeout>>()
+
+function queueNotification(content: string, meta: Record<string, string>): void {
+  const chatId = meta.chat_id
+  if (!pendingMessages.has(chatId)) pendingMessages.set(chatId, [])
+  pendingMessages.get(chatId)!.push({ content, meta })
+
+  const existing = flushTimers.get(chatId)
+  if (existing) clearTimeout(existing)
+
+  flushTimers.set(chatId, setTimeout(() => flushMessages(chatId), DEBOUNCE_MS))
+}
+
+function flushMessages(chatId: string): void {
+  const msgs = pendingMessages.get(chatId)
+  pendingMessages.delete(chatId)
+  flushTimers.delete(chatId)
+  if (!msgs || msgs.length === 0) return
+
+  if (msgs.length === 1) {
+    mcp.notification({
+      method: 'notifications/claude/channel',
+      params: { content: msgs[0].content, meta: msgs[0].meta },
+    }).catch(err => {
+      process.stderr.write(`telegram channel: failed to deliver inbound to Claude: ${err}\n`)
+    })
+    return
+  }
+
+  // Combine multiple messages into one notification
+  const combined = msgs.map(m => m.content).join('\n')
+  const lastMeta = { ...msgs[msgs.length - 1].meta }
+
+  // Collect all image paths — attach last one as image_path
+  const images = msgs.map(m => m.meta.image_path).filter(Boolean) as string[]
+  if (images.length > 0) lastMeta.image_path = images[images.length - 1]
+
+  // Collect all attachment info from messages that have it
+  const withAttach = msgs.filter(m => m.meta.attachment_kind)
+  if (withAttach.length > 0) {
+    const last = withAttach[withAttach.length - 1]
+    lastMeta.attachment_kind = last.meta.attachment_kind
+    lastMeta.attachment_file_id = last.meta.attachment_file_id
+    if (last.meta.attachment_size) lastMeta.attachment_size = last.meta.attachment_size
+    if (last.meta.attachment_mime) lastMeta.attachment_mime = last.meta.attachment_mime
+    if (last.meta.attachment_name) lastMeta.attachment_name = last.meta.attachment_name
+  }
+
+  mcp.notification({
+    method: 'notifications/claude/channel',
+    params: { content: combined, meta: lastMeta },
+  }).catch(err => {
+    process.stderr.write(`telegram channel: failed to deliver inbound to Claude: ${err}\n`)
+  })
 }
 
 // reply's files param takes any path. .env is ~60 bytes and ships as a
@@ -976,30 +1043,24 @@ async function handleInbound(
 
   // image_path goes in meta only — an in-content "[image attached — read: PATH]"
   // annotation is forgeable by any allowlisted sender typing that string.
-  mcp.notification({
-    method: 'notifications/claude/channel',
-    params: {
-      content: text,
-      meta: {
-        chat_id,
-        ...(msgId != null ? { message_id: String(msgId) } : {}),
-        user: from.username ?? String(from.id),
-        user_id: String(from.id),
-        ts: new Date((ctx.message?.date ?? 0) * 1000).toISOString(),
-        ...(ctx.message?.forward_origin ? { forwarded: 'true' } : {}),
-        ...(imagePath ? { image_path: imagePath } : {}),
-        ...(attachment ? {
-          attachment_kind: attachment.kind,
-          attachment_file_id: attachment.file_id,
-          ...(attachment.size != null ? { attachment_size: String(attachment.size) } : {}),
-          ...(attachment.mime ? { attachment_mime: attachment.mime } : {}),
-          ...(attachment.name ? { attachment_name: attachment.name } : {}),
-        } : {}),
-      },
-    },
-  }).catch(err => {
-    process.stderr.write(`telegram channel: failed to deliver inbound to Claude: ${err}\n`)
-  })
+  const meta: Record<string, string> = {
+    chat_id,
+    ...(msgId != null ? { message_id: String(msgId) } : {}),
+    user: from.username ?? String(from.id),
+    user_id: String(from.id),
+    ts: new Date((ctx.message?.date ?? 0) * 1000).toISOString(),
+    ...(ctx.message?.forward_origin ? { forwarded: 'true' } : {}),
+    ...(imagePath ? { image_path: imagePath } : {}),
+    ...(attachment ? {
+      attachment_kind: attachment.kind,
+      attachment_file_id: attachment.file_id,
+      ...(attachment.size != null ? { attachment_size: String(attachment.size) } : {}),
+      ...(attachment.mime ? { attachment_mime: attachment.mime } : {}),
+      ...(attachment.name ? { attachment_name: attachment.name } : {}),
+    } : {}),
+  }
+
+  queueNotification(text, meta)
 }
 
 // Without this, any throw in a message handler stops polling permanently
