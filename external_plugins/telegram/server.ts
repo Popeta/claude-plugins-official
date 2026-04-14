@@ -732,23 +732,16 @@ function shutdown(): void {
   setTimeout(() => process.exit(0), 2000)
   void Promise.resolve(bot.stop()).finally(() => process.exit(0))
 }
-process.stdin.on('end', shutdown)
-process.stdin.on('close', shutdown)
+// Shutdown only on explicit signals. The 409-Conflict zombie problem is
+// already handled by the startup PID-file check above: when a new session
+// spawns server.ts, it reads bot.pid, finds the previous PID, and SIGTERMs
+// it before writing its own. That covers the case Claude Code's stdin-close
+// and orphan-watchdog were meant to defend against — without the side effect
+// of killing the bot every time the user backgrounds the terminal or the
+// session goes idle.
 process.on('SIGTERM', shutdown)
 process.on('SIGINT', shutdown)
 process.on('SIGHUP', shutdown)
-
-// Orphan watchdog: stdin events above don't reliably fire when the parent
-// chain (`bun run` wrapper → shell → us) is severed by a crash. Poll for
-// reparenting (POSIX) or a dead stdin pipe and self-terminate.
-const bootPpid = process.ppid
-setInterval(() => {
-  const orphaned =
-    (process.platform !== 'win32' && process.ppid !== bootPpid) ||
-    process.stdin.destroyed ||
-    process.stdin.readableEnded
-  if (orphaned) shutdown()
-}, 5000).unref()
 
 // Commands are DM-only. Responding in groups would: (1) leak pairing codes via
 // /status to other group members, (2) confirm bot presence in non-allowlisted
