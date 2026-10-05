@@ -14,7 +14,7 @@
 При мерже `upstream/main`:
 
 1. `git fetch upstream && git show upstream/main:external_plugins/telegram/.claude-plugin/plugin.json | grep version` — проверить версию
-2. **Если version > 0.0.5** — мержить upstream/main
+2. **Если version > 0.0.7** — мержить upstream/main
 3. **ПРОВЕРИТЬ** что наши фиксы НЕ вернулись в состояние upstream:
    - orphan watchdog НЕ вернулся
    - stdin-close handlers НЕ вернулись
