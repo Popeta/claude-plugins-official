@@ -1704,7 +1704,7 @@
       "source": {
         "source": "url",
         "url": "https://github.com/gemini-cli-extensions/google-cloud-storage.git",
-        "sha": "c7e3eeefa14ac0492a024458061d662e8b04c891"
+        "sha": "ab0883d81107e354c08893e6df467dc8e358ae7b"
       },
       "homepage": "https://cloud.google.com/storage"
     },
