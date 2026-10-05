@@ -24,7 +24,8 @@ import { execFileSync } from 'child_process'
 import { homedir } from 'os'
 import { join, extname, sep } from 'path'
 
-const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
+const STATE_DIR = process.env.TELEGRAM_STATE_DIR
+  ?? join(process.env.CLAUDE_CONFIG_DIR ?? join(homedir(), '.claude'), 'channels', 'telegram')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
 const APPROVED_DIR = join(STATE_DIR, 'approved')
 const ENV_FILE = join(STATE_DIR, '.env')
@@ -69,9 +70,13 @@ let ownerAlive = false
 let owningPid = 0
 try {
   owningPid = parseInt(readFileSync(PID_FILE, 'utf8'), 10)
-  if (owningPid > 1 && owningPid !== process.pid) {
+  if (owningPid > 1 && owningPid !== process.pid && owningPid !== process.ppid) {
     process.kill(owningPid, 0) // throws if dead -> caught -> ownerAlive stays false
-    ownerAlive = true
+    // PID files race with OS PID recycling (upstream 0.0.7) — a recycled PID
+    // may now belong to an unrelated process or to our own bun-run wrapper.
+    // Only a live server.ts process counts as the owner; otherwise reclaim.
+    const cmd = execFileSync('ps', ['-p', String(owningPid), '-o', 'args='], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })
+    if (cmd.includes('server.ts')) ownerAlive = true
   }
 } catch {}
 
@@ -381,6 +386,19 @@ function gate(ctx: Context): GateResult {
   }
 
   return { action: 'drop' }
+}
+
+// Like gate() but for bot commands: no pairing side effects, just allow/drop.
+function dmCommandGate(ctx: Context): { access: Access; senderId: string } | null {
+  if (ctx.chat?.type !== 'private') return null
+  if (!ctx.from) return null
+  const senderId = String(ctx.from.id)
+  const access = loadAccess()
+  const pruned = pruneExpired(access)
+  if (pruned) saveAccess(access)
+  if (access.dmPolicy === 'disabled') return null
+  if (access.dmPolicy === 'allowlist' && !access.allowFrom.includes(senderId)) return null
+  return { access, senderId }
 }
 
 function isMentioned(ctx: Context, extraPatterns?: string[]): boolean {
@@ -748,10 +766,10 @@ function shutdown(): void {
   void Promise.resolve(bot.stop()).finally(() => process.exit(0))
 }
 // Shutdown only on explicit signals. The 409-Conflict zombie problem is
-// already handled by the startup PID-file check above: when a new session
-// spawns server.ts, it reads bot.pid, finds the previous PID, and SIGTERMs
-// it before writing its own. That covers the case Claude Code's stdin-close
-// and orphan-watchdog were meant to defend against — without the side effect
+// already handled by the startup PID-file check above (first session wins:
+// a live owner makes new sessions exit; a dead/recycled PID is reclaimed).
+// That covers the case Claude Code's stdin-close and orphan-watchdog were
+// meant to defend against — without the side effect
 // of killing the bot every time the user backgrounds the terminal or the
 // session goes idle.
 process.on('SIGTERM', shutdown)
@@ -764,12 +782,7 @@ process.on('SIGHUP', shutdown)
 // the gate's behavior for unrecognized groups.
 
 bot.command('start', async ctx => {
-  if (ctx.chat?.type !== 'private') return
-  const access = loadAccess()
-  if (access.dmPolicy === 'disabled') {
-    await ctx.reply(`This bot isn't accepting new connections.`)
-    return
-  }
+  if (!dmCommandGate(ctx)) return
   await ctx.reply(
     `This bot bridges Telegram to a Claude Code session.\n\n` +
     `To pair:\n` +
@@ -780,7 +793,7 @@ bot.command('start', async ctx => {
 })
 
 bot.command('help', async ctx => {
-  if (ctx.chat?.type !== 'private') return
+  if (!dmCommandGate(ctx)) return
   await ctx.reply(
     `Messages you send here route to a paired Claude Code session. ` +
     `Text and photos are forwarded; replies and reactions come back.\n\n` +
@@ -790,14 +803,12 @@ bot.command('help', async ctx => {
 })
 
 bot.command('status', async ctx => {
-  if (ctx.chat?.type !== 'private') return
-  const from = ctx.from
-  if (!from) return
-  const senderId = String(from.id)
-  const access = loadAccess()
+  const gated = dmCommandGate(ctx)
+  if (!gated) return
+  const { access, senderId } = gated
 
   if (access.allowFrom.includes(senderId)) {
-    const name = from.username ? `@${from.username}` : senderId
+    const name = ctx.from!.username ? `@${ctx.from!.username}` : senderId
     await ctx.reply(`Paired as ${name}.`)
     return
   }
@@ -1109,14 +1120,17 @@ bot.catch(err => {
   process.stderr.write(`telegram channel: handler error (polling continues): ${err.error}\n`)
 })
 
-// 409 Conflict = another getUpdates consumer is still active (zombie from a
-// previous session, or a second Claude Code instance). Retry with backoff
-// until the slot frees up instead of crashing on the first rejection.
+// Retry polling with backoff on any error. Previously only 409 was retried —
+// a single ETIMEDOUT/ECONNRESET/DNS failure rejected bot.start(), the catch
+// returned, and polling stopped permanently while the process stayed alive
+// (MCP stdin keeps it running). Outbound tools kept working but the bot was
+// deaf to inbound messages until a full restart.
 void (async () => {
   for (let attempt = 1; ; attempt++) {
     try {
       await bot.start({
         onStart: info => {
+          attempt = 0
           botUsername = info.username
           process.stderr.write(`telegram channel: polling as @${info.username}\n`)
           void bot.api.setMyCommands(
@@ -1132,28 +1146,22 @@ void (async () => {
       return // bot.stop() was called — clean exit from the loop
     } catch (err) {
       if (shuttingDown) return
-      if (err instanceof GrammyError && err.error_code === 409) {
-        if (attempt >= 8) {
-          process.stderr.write(
-            `telegram channel: 409 Conflict persists after ${attempt} attempts — ` +
-            `another poller is holding the bot token (stray 'bun server.ts' process or a second session). Exiting.\n`,
-          )
-          return
-        }
-        const delay = Math.min(1000 * attempt, 15000)
-        const detail = attempt === 1
-          ? ' — another instance is polling (zombie session, or a second Claude Code running?)'
-          : ''
-        process.stderr.write(
-          `telegram channel: 409 Conflict${detail}, retrying in ${delay / 1000}s\n`,
-        )
-        await new Promise(r => setTimeout(r, delay))
-        continue
-      }
       // bot.stop() mid-setup rejects with grammy's "Aborted delay" — expected, not an error.
       if (err instanceof Error && err.message === 'Aborted delay') return
-      process.stderr.write(`telegram channel: polling failed: ${err}\n`)
-      return
+      const is409 = err instanceof GrammyError && err.error_code === 409
+      if (is409 && attempt >= 8) {
+        process.stderr.write(
+          `telegram channel: 409 Conflict persists after ${attempt} attempts — ` +
+          `another poller is holding the bot token (stray 'bun server.ts' process or a second session). Exiting.\n`,
+        )
+        return
+      }
+      const delay = Math.min(1000 * attempt, 15000)
+      const detail = is409
+        ? `409 Conflict${attempt === 1 ? ' — another instance is polling (zombie session, or a second Claude Code running?)' : ''}`
+        : `polling error: ${err}`
+      process.stderr.write(`telegram channel: ${detail}, retrying in ${delay / 1000}s\n`)
+      await new Promise(r => setTimeout(r, delay))
     }
   }
 })()
